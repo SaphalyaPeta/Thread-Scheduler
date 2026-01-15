@@ -1,0 +1,515 @@
+diff --git a/libscheduler/init.c b/libscheduler/init.c
+index e1695d8..26b1df0 100644
+--- a/libscheduler/init.c
++++ b/libscheduler/init.c
+@@ -25,12 +25,11 @@ void init_scheduler(enum sch_type type, int count) {
+     init_queue(&ready_queue);
+     init_queue(&io_queue);
+ 
+-    // Initialize MLFQ queues
++    // MLFQ queues
+     for (int i = 0; i < 5; i++) {
+         init_queue(&mlfq[i]);
+     }
+ 
+-    // Initialize per-thread MLFQ metadata
+     for (int i = 0; i < MAX_THREADS; i++) {
+         mlfq_data[i].level = 0;
+         mlfq_data[i].quantum_used = 0;
+@@ -60,6 +59,9 @@ void finish_scheduler() {
+         pthread_mutex_destroy(&semaphores[i].mutex);
+         pthread_cond_destroy(&semaphores[i].cond);
+     }
++
++    pthread_cond_destroy(&barrier_cond);
++    pthread_cond_destroy(&timeCond);
+     
+     free(tcb_array);
+     tcb_array = NULL;
+diff --git a/libscheduler/interface.c b/libscheduler/interface.c
+index 574bed7..8008dcb 100644
+--- a/libscheduler/interface.c
++++ b/libscheduler/interface.c
+@@ -8,7 +8,7 @@
+ 
+ int cpu_me(float current_time, int tid, int remaining_time) {
+     pthread_mutex_lock(&scheduler_mutex);
+-    printf("CPU called for tid:%d called at time: %f\n", tid, current_time);
++    // printf("CPU called for tid:%d called at time: %f\n", tid, current_time);
+ 
+     thread_control_block_t* tcb = &tcb_array[tid];
+     tcb->remaining_time = remaining_time;
+@@ -40,10 +40,9 @@ int cpu_me(float current_time, int tid, int remaining_time) {
+         tcb->ready_arrival_tick = current_time;
+         current_cpu_thread = NULL;
+     } else {
+-        // MLFQ handling
+         bool new_burst = (tcb->last_cpu_remaining <= 0 || remaining_time > tcb->last_cpu_remaining);
+         if (new_burst) {
+-            printf("new burst detected in cpu me for tid: %d\n", tid);
++            // printf("new burst detected in cpu me for tid: %d\n", tid);
+             tcb->ready_arrival_tick = current_time;
+             promote_on_new_burst(tcb);
+             current_cpu_thread = NULL;
+@@ -51,22 +50,23 @@ int cpu_me(float current_time, int tid, int remaining_time) {
+     }
+ 
+     // If this thread isn’t already running on CPU put it in the ready queue. 
++    // Not adding in ready queue for MLFQ because we are managing different queues all together.
+     if (scheduler_type == SCH_FCFS || scheduler_type == SCH_SRTF) {
+         if (current_cpu_thread != tcb) {
+-            printf("Enqueued for %d in CPU me\n", tcb->tid);
++            // printf("Enqueued for %d in CPU me\n", tcb->tid);
+             enqueue(&ready_queue, tcb);
+             tcb->state = STATE_READY;
+         }
+     }
+ 
+-    barrier_wait();
++    wait_till_all_threads_arrive();
+ 
+     // Checking if CPU is idle,
+-    printf("Barrier crossed for %d in cpu_me\n", tcb->tid);
++    // printf("Barrier crossed for %d in cpu_me\n", tcb->tid);
+     if (current_cpu_thread == NULL) {
+         current_cpu_thread = select_next_thread();
+         if (current_cpu_thread != NULL) {
+-            printf("current_cpu_thread is allocated to %d in cpu_me\n", current_cpu_thread->tid);
++            // printf("current_cpu_thread is allocated to %d in cpu_me\n", current_cpu_thread->tid);
+             current_cpu_thread->state = STATE_RUNNING;
+             pthread_cond_signal(&current_cpu_thread->cond);
+         }
+@@ -75,11 +75,11 @@ int cpu_me(float current_time, int tid, int remaining_time) {
+     // If this thread wasn’t chosen, it sleeps until the scheduler signals it.
+     // Guarantees only one thread runs at a time.
+     if (current_cpu_thread != tcb) {
+-        printf("%d thread is waiting in Cpu_me for signal\n", tcb->tid);
++        // printf("%d thread is waiting in Cpu_me for signal\n", tcb->tid);
+         // printf("Current CPU thread at this moment: %d\n",current_cpu_thread->tid);
+         pthread_cond_wait(&tcb->cond, &scheduler_mutex);
+     }
+-    printf("%d thread got the signal in cpu_me\n", tid);
++    // printf("%d thread got the signal in cpu_me\n", tid);
+ 
+     int int_time = ceil(current_time);
+     advance_time_to(int_time);
+@@ -98,12 +98,14 @@ int cpu_me(float current_time, int tid, int remaining_time) {
+         int lvl = mlfq_data[tid].level;
+         int quantum = MLFQ_TIME_QUANTUM[lvl];
+     
+-        // If thread used full quantum (and still not done), demote
++        // If thread used full quantum we demote
+         if (mlfq_data[tid].quantum_used >= quantum && tcb->remaining_time > 0) {
+             dequeue_tid_from_q(&mlfq[lvl], tid);
+             tcb->ready_arrival_tick = current_time;
+             demote_mlfq_thread(tcb);
+-            if (current_cpu_thread == tcb) current_cpu_thread = NULL;
++            if (current_cpu_thread == tcb) {
++                current_cpu_thread = NULL;
++            }
+         }
+     }
+     
+@@ -115,21 +117,21 @@ int cpu_me(float current_time, int tid, int remaining_time) {
+ 
+ int io_me(float current_time, int tid, int duration) {
+     pthread_mutex_lock(&scheduler_mutex);
+-    printf("io_me called for tid:%d\n", tid); 
++    // printf("io_me called for tid:%d\n", tid); 
+     
+-    barrier_wait();
++    wait_till_all_threads_arrive();
+     
+-    printf("Barrier crossed for io_me %d\n", tid);
++    // printf("Barrier crossed for io_me %d\n", tid);
+     thread_control_block_t* tcb = &tcb_array[tid];
+     
+     // If the current thread was on the CPU, it must give it up before blocking for I/O.
+     if (current_cpu_thread == tcb) {
+         current_cpu_thread = select_next_thread();
+         if (current_cpu_thread != NULL) {
+-            printf("current_cpu_thread is allocated to %d in io_me\n", current_cpu_thread->tid);
++            // printf("current_cpu_thread is allocated to %d in io_me\n", current_cpu_thread->tid);
+             current_cpu_thread->state = STATE_RUNNING;
+             pthread_cond_signal(&current_cpu_thread->cond);
+-            printf("%d signaled from io_me to get unblocked\n", current_cpu_thread->tid);
++            // printf("%d signaled from io_me to get unblocked\n", current_cpu_thread->tid);
+         }
+     }
+     
+@@ -146,13 +148,11 @@ int io_me(float current_time, int tid, int duration) {
+     // Wait until we become the active IO thread
+     while (current_io_thread != tcb) {
+         pthread_cond_wait(&tcb->cond, &scheduler_mutex);
+-        printf("%d is waiting\n",tcb->tid);
++        // printf("%d is waiting\n",tcb->tid);
+     }
+ 
+     int int_time = ceil(current_time);
+-    // advance_time_to(int_time);
+ 
+-    // Perform IO for full duration
+     int start_time = 0;
+     if (global_IO_time > int_time) {
+         start_time = global_IO_time;
+@@ -162,14 +162,15 @@ int io_me(float current_time, int tid, int duration) {
+     int io_completion_time = start_time + duration;
+     advance_IO_time_to(io_completion_time);
+ 
+-    // IO complete: pop ourselves from queue and hand cpu to next in the waiting list
+-    (void)dequeue(&io_queue); // remove self (at head)
++    // IO complete - pop thread with tid from queue and hand cpu to next in the waiting list.
++    (void)dequeue(&io_queue); // remove the thread with tid from head from queue.
+     current_io_thread = peek(&io_queue);
+     if (current_io_thread) {
+         pthread_cond_signal(&current_io_thread->cond);
+     }
+ 
+     arrived_count--;
++    // printf("returning from IO at time: %d for tid: %d\n", io_completion_time, tid);
+ 
+     pthread_mutex_unlock(&scheduler_mutex);
+     
+@@ -179,11 +180,11 @@ int io_me(float current_time, int tid, int duration) {
+ int P(float current_time, int tid, int sem_id) {
+     pthread_mutex_lock(&scheduler_mutex);
+ 
+-    printf("P called for tid:%d\n", tid);
++    // printf("P called for tid:%d\n", tid);
+ 
+     thread_control_block_t* tcb = &tcb_array[tid];
+-    barrier_wait();
+-    printf("barrier crossed for tid: %d\n", tid);
++    wait_till_all_threads_arrive();
++    // printf("barrier crossed for tid: %d\n", tid);
+     
+     int int_time = ceil(current_time);
+     
+@@ -200,7 +201,7 @@ int P(float current_time, int tid, int sem_id) {
+         // P returns instantly at call’s integer tick
+         return int_time;
+     } else {
+-        printf("Sempahore not found for tid: %d in P\n", tid);
++        // printf("Sempahore not found for tid: %d in P\n", tid);
+         // Semaphore unavailable therefore blocking
+         // If the thread calling P was running on CPU, it must release CPU.
+         // Scheduler immediately picks another ready thread.
+@@ -209,7 +210,7 @@ int P(float current_time, int tid, int sem_id) {
+             if (current_cpu_thread != NULL) {
+                 current_cpu_thread->state = STATE_RUNNING;
+                 pthread_cond_signal(&current_cpu_thread->cond);
+-                printf("%d Signaled from P after semaphore is not found\n", current_cpu_thread->tid);
++                // printf("%d Signaled from P after semaphore is not found\n", current_cpu_thread->tid);
+             }
+         }
+         
+@@ -221,7 +222,7 @@ int P(float current_time, int tid, int sem_id) {
+         
+         // Wait to be woken up
+         while (tcb->state == STATE_BLOCKED_SEM) {
+-            printf("%d is waiting in P\n",tcb->tid);
++            // printf("%d is waiting in P\n",tcb->tid);
+             blocked_on_p_count++;
+             pthread_cond_signal(&timeCond);
+             pthread_cond_wait(&tcb->cond, &scheduler_mutex);
+@@ -230,8 +231,7 @@ int P(float current_time, int tid, int sem_id) {
+         }
+         advance_time_to(int_time);
+     }
+-    
+-    // Blocked case: we were woken by V() at an integer time; return that tick
++
+     int ret = tcb->wake_time;
+     arrived_count--;
+     pthread_mutex_unlock(&scheduler_mutex);
+@@ -240,18 +240,17 @@ int P(float current_time, int tid, int sem_id) {
+ 
+ int V(float current_time, int tid, int sem_id) {
+     pthread_mutex_lock(&scheduler_mutex);
+-    printf("V called for tid:%d\n", tid);
++    // printf("V called for tid:%d\n", tid);
+ 
+-    barrier_wait();
+-    printf("Barrier passed for %d in V\n",tid);
++    wait_till_all_threads_arrive();
++    // printf("Barrier passed for %d in V\n",tid);
+ 
+     int int_time = ceil(current_time);
+     while (active_threads-blocked_on_p_count!=1 && global_time < int_time) {
+         pthread_cond_wait(&timeCond, &scheduler_mutex);
+     }
+ 
+-    thread_control_block_t* tcb = &tcb_array[tid];
+-    printf("V got a signal to run thread: %d\n", tid);
++    // printf("V got a signal to run thread: %d\n", tid);
+ 
+     pthread_mutex_lock(&semaphores[sem_id].mutex);
+     
+@@ -278,7 +277,7 @@ int V(float current_time, int tid, int sem_id) {
+             
+             tcb_to_wake->wake_time = int_time;
+             tcb_to_wake->state = STATE_READY;
+-            printf("%d signaled to be get unblocked after increasing semaphore in V\n", tcb_to_wake->tid);
++            // printf("%d signaled to be get unblocked after increasing semaphore in V\n", tcb_to_wake->tid);
+             pthread_cond_signal(&tcb_to_wake->cond);
+ 
+             // Reducing thread count so that main.c do not call any other function 
+@@ -301,20 +300,20 @@ int V(float current_time, int tid, int sem_id) {
+ void end_me(int tid) {
+     pthread_mutex_lock(&scheduler_mutex);
+ 
+-    printf("end me called for tid:%d\n", tid);
++    // printf("end me called for tid:%d\n", tid);
+     
+     thread_control_block_t* tcb = &tcb_array[tid];
+     tcb->state = STATE_TERMINATED;
+     
+     // printf("In end me current thread: %d and tcb: %d", current_cpu_thread->tcb)
+-    // If this was the current CPU thread, select a new one
++    // If this was the current CPU thread, select a new thread.
+     if (current_cpu_thread == tcb) {
+-        printf("Selecting next thread from here\n");
++        // printf("Selecting next thread from here\n");
+         current_cpu_thread = select_next_thread();
+         if (current_cpu_thread != NULL) {
+             current_cpu_thread->state = STATE_RUNNING;
+             pthread_cond_signal(&current_cpu_thread->cond);
+-            printf("%d signaled from endme\n",current_cpu_thread->tid);
++            // printf("%d signaled from endme\n",current_cpu_thread->tid);
+         }
+     }
+ 
+diff --git a/libscheduler/scheduler.c b/libscheduler/scheduler.c
+index 7d00f10..161c09a 100644
+--- a/libscheduler/scheduler.c
++++ b/libscheduler/scheduler.c
+@@ -87,7 +87,7 @@ void dequeue_tid_from_q(queue_t* q, int tid) {
+ void advance_time_to(int target_time) {
+     while (global_time < target_time) {
+         global_time++;
+-        printf("Global time : %d\n", global_time);
++        // printf("Global time : %d\n", global_time);
+         pthread_cond_broadcast(&timeCond);
+     }
+ }
+@@ -121,7 +121,7 @@ thread_control_block_t* select_next_thread_fcfs(queue_t* q) {
+     for (int i = 0; i < q->count; i++) {
+         int idx = (q->front + i) % MAX_THREADS;
+         thread_control_block_t* t = q->threads[idx];
+-        printf("Thread %d ready arrival tick %f\n", t->tid, t->ready_arrival_tick);
++        // printf("Thread %d ready arrival tick %f\n", t->tid, t->ready_arrival_tick);
+         if (t->ready_arrival_tick < best_tick ||
+             (t->ready_arrival_tick == best_tick && t->tid < best_tid)) {
+             best_tick = t->ready_arrival_tick;
+@@ -139,27 +139,25 @@ thread_control_block_t* select_next_thread_fcfs(queue_t* q) {
+ thread_control_block_t* select_next_thread_srtf() {
+     if (ready_queue.count == 0) return NULL;
+ 
+-    // Temporary candidate array
++    // Temp candidate array
+     thread_control_block_t* candidates[MAX_THREADS];
+     int candidate_count = 0;
+ 
+-    // Step 1 & 2: filter threads that are ready to run now
+     for (int i = 0; i < ready_queue.count; i++) {
+         int idx = (ready_queue.front + i) % MAX_THREADS;
+         thread_control_block_t* t = ready_queue.threads[idx];
+ 
+         if (t->ready_arrival_tick <= global_time) {
+             candidates[candidate_count++] = t;
+-            printf("Candidate T%d: ready_arrival_tick=%f, remaining=%d\n",
+-                   t->tid, t->ready_arrival_tick, t->remaining_time);
+-        }
+-        else {
+-            printf("Lagging Candidate T%d: ready_arrival_tick=%f, remaining=%d\n",
+-                t->tid, t->ready_arrival_tick, t->remaining_time);
++            // printf("Candidate T%d: ready_arrival_tick=%f, remaining=%d\n",
++            //        t->tid, t->ready_arrival_tick, t->remaining_time);
+         }
++        // else {
++        //     printf("Lagging Candidate T%d: ready_arrival_tick=%f, remaining=%d\n",
++        //         t->tid, t->ready_arrival_tick, t->remaining_time);
++        // }
+     }
+ 
+-    // Step 3: pick best among candidates
+     if (candidate_count == 0) {
+         // No thread is ready yet → return NULL
+         // If all threads are lagging behind the global time then we should signal thread which arrived first.
+@@ -187,7 +185,7 @@ thread_control_block_t* select_next_thread_srtf() {
+     }
+ 
+     thread_control_block_t* res = candidates[best_idx];
+-    printf("Selected T%d by SRTF remaining=%d\n", res->tid, res->remaining_time);
++    // printf("Selected T%d by SRTF remaining=%d\n", res->tid, res->remaining_time);
+ 
+     return res;
+ }
+@@ -205,7 +203,7 @@ void demote_mlfq_thread(thread_control_block_t* tcb) {
+     int new_level = (old < 4) ? old + 1 : old;
+     enqueue_mlfq(tcb, new_level);
+     mlfq_data[tcb->tid].quantum_used = 0;
+-    printf("tid%d demoted from tid%d to tid%d\n", tcb->tid, old, new_level);
++    // printf("tid%d demoted from tid%d to tid%d\n", tcb->tid, old, new_level);
+ }
+ 
+ void promote_on_new_burst(thread_control_block_t* tcb) {
+@@ -214,27 +212,28 @@ void promote_on_new_burst(thread_control_block_t* tcb) {
+     enqueue_mlfq(tcb, 0);
+ }
+ 
+-// void print_mlfq_state() {
+-//     for (int lvl = 0; lvl < 5; lvl++) {
+-//         printf("Level %d (quantum=%d): ", lvl, MLFQ_TIME_QUANTUM[lvl]);
+-
+-//         if (mlfq[lvl].count == 0) {
+-//             printf("[empty]\n");
+-//             continue;
+-//         }
+-
+-//         // Iterate circularly over queue
+-//         for (int i = 0; i < mlfq[lvl].count; i++) {
+-//             int idx = (mlfq[lvl].front + i) % MAX_THREADS;
+-//             thread_control_block_t* t = mlfq[lvl].threads[idx];
+-//             printf("T%d(quantum_used=%d)(ready_arrival=%f)", 
+-//                    t->tid, mlfq_data[t->tid].quantum_used, t->ready_arrival_tick);
+-//         }
+-//         printf("\n");
+-//     }
+-// }
++// Written For debugging purpose.
++void print_mlfq_state() {
++    for (int lvl = 0; lvl < 5; lvl++) {
++        printf("Level %d (quantum=%d): ", lvl, MLFQ_TIME_QUANTUM[lvl]);
++
++        if (mlfq[lvl].count == 0) {
++            printf("empty\n");
++            continue;
++        }
++
++        for (int i = 0; i < mlfq[lvl].count; i++) {
++            int idx = (mlfq[lvl].front + i) % MAX_THREADS;
++            thread_control_block_t* t = mlfq[lvl].threads[idx];
++            printf("T%d(quantum_used=%d)(ready_arrival=%f)", 
++                   t->tid, mlfq_data[t->tid].quantum_used, t->ready_arrival_tick);
++        }
++        printf("\n");
++    }
++}
+ 
+ thread_control_block_t* select_next_thread_mlfq() {
++    // print_mlfq_state();
+     queue_t temp[5];
+     for (int i = 0; i < 5; i++) {
+         init_queue(&temp[i]);
+@@ -246,8 +245,8 @@ thread_control_block_t* select_next_thread_mlfq() {
+             thread_control_block_t* t = mlfq[lvl].threads[idx];
+             if (t->ready_arrival_tick <= global_time) {
+                 enqueue(&temp[lvl], t);
+-                printf("T%d from L%d added to temp queue (ready tick %.1f <= global %d)\n",
+-                       t->tid, lvl, t->ready_arrival_tick, global_time);
++                // printf("T%d from L%d added to temp queue (ready tick %f <= global %d)\n",
++                //        t->tid, lvl, t->ready_arrival_tick, global_time);
+             }
+         }
+     }
+@@ -256,8 +255,8 @@ thread_control_block_t* select_next_thread_mlfq() {
+         if (temp[lvl].count > 0) {
+             thread_control_block_t* next = select_next_thread_fcfs(&temp[lvl]);
+             mlfq_data[next->tid].level = lvl;
+-            printf("Picked T%d from level %d (quantum %d)\n",
+-                   next->tid, lvl, MLFQ_TIME_QUANTUM[lvl]);
++            // printf("Picked T%d from level %d (quantum %d)\n",
++            //        next->tid, lvl, MLFQ_TIME_QUANTUM[lvl]);
+             return next;
+         }
+     }
+@@ -276,8 +275,8 @@ thread_control_block_t* select_next_thread_mlfq() {
+     }
+ 
+     if (earliest_thread != NULL) {
+-        printf("No thread ready. Advancing time to earliest arrival - T%d, tick %f)\n",
+-               earliest_thread->tid, earliest_thread->ready_arrival_tick);
++        // printf("No thread ready. Advancing time to earliest arrival - T%d, tick %f)\n",
++        //        earliest_thread->tid, earliest_thread->ready_arrival_tick);
+         advance_time_to(ceil(earliest_thread->ready_arrival_tick));
+         return earliest_thread;
+     }
+@@ -285,9 +284,9 @@ thread_control_block_t* select_next_thread_mlfq() {
+     return NULL;
+ }
+ 
+-void barrier_wait() {
++void wait_till_all_threads_arrive() {
+     arrived_count++;
+-    printf("Arrived thread Count: %d\n", arrived_count);
++    // printf("Arrived thread Count: %d\n", arrived_count);
+     if (arrived_count < active_threads) {
+         pthread_cond_wait(&barrier_cond, &scheduler_mutex);
+     } else {
+diff --git a/libscheduler/scheduler.h b/libscheduler/scheduler.h
+index 46e1654..7224e63 100644
+--- a/libscheduler/scheduler.h
++++ b/libscheduler/scheduler.h
+@@ -14,9 +14,9 @@
+ 
+ #include "api.h"
+ 
+-#define MAX_THREADS 128
++#define MAX_THREADS 5000
+ 
+-// Thread states
++// These are thread states.
+ typedef enum {
+     STATE_READY,
+     STATE_RUNNING,
+@@ -25,7 +25,7 @@ typedef enum {
+     STATE_TERMINATED
+ } thread_state_t;
+ 
+-// Thread Control Block
++// Thread Control Block which saves the data of particular thread.
+ typedef struct {
+     int tid;
+     float arrival_time;
+@@ -38,11 +38,11 @@ typedef struct {
+ } thread_control_block_t;
+ 
+ typedef struct {
+-    int level;          // current MLFQ level (0 = highest)
+-    int quantum_used;   // ticks used in current level
++    int level;          
++    int quantum_used;
+ } mlfq_info_t;
+ 
+-// Semaphore structure
++// Holds the information of semaphores.
+ typedef struct {
+     int value;
+     pthread_mutex_t mutex;
+@@ -51,7 +51,7 @@ typedef struct {
+     int blocked_count;
+ } semaphore_t;
+ 
+-// Queue structure
++// Holda information of a queue.( for example of ready queue)
+ typedef struct {
+     thread_control_block_t* threads[MAX_THREADS];
+     int front;
+@@ -67,7 +67,7 @@ extern int thread_count;
+ extern pthread_mutex_t scheduler_mutex;
+ 
+ extern int active_threads;
+-extern int arrived_count;    // number of threads still alive (not terminated)
++extern int arrived_count;
+ extern pthread_cond_t barrier_cond;
+ extern pthread_cond_t timeCond;
+ extern int blocked_on_p_count;
+@@ -98,4 +98,4 @@ thread_control_block_t* select_next_thread_mlfq();
+ void enqueue_mlfq(thread_control_block_t* tcb, int level);
+ void demote_mlfq_thread(thread_control_block_t* tcb);
+ void promote_on_new_burst(thread_control_block_t* tcb);
+-void barrier_wait();
+\ No newline at end of file
++void wait_till_all_threads_arrive();
+\ No newline at end of file
